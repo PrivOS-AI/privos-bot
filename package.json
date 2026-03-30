@@ -1,0 +1,14 @@
+{
+  "name": "privos-bot",
+  "version": "2.0.0",
+  "description": "Webhook bot bridging Privos chat to TVibe AI via Express server",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js",
+    "dev": "node --watch bot.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "express": "^4.21.0"
+  }
+}
