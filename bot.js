@@ -14,7 +14,8 @@ const {
 
 const PRIVOS_BOT_USER_ID = PRIVOS_BOT_TOKEN?.split('_')[1];
 const BOT_HEADERS = { Authorization: `Bearer ${PRIVOS_BOT_TOKEN}`, 'Content-Type': 'application/json' };
-const EDIT_INTERVAL_MS = 800;
+const EDIT_INTERVAL_MS = 800;      // legacy editMessage cadence
+const CHUNK_INTERVAL_MS = 150;     // streaming API cadence (no DB write per chunk)
 const WORD_DELAY_MS = 60; // delay between each word for streaming effect
 
 // ~2000-word song lyrics for streaming test
@@ -337,31 +338,72 @@ async function handleMessage(room, message) {
 }
 
 async function streamSongLyrics(roomId) {
+  // Try streaming API first — falls back to legacy editMessage if unavailable
+  const streamingSession = await startStreaming(roomId);
+  const useStreamingAPI = streamingSession !== null;
+  const streamingMessageId = streamingSession?.messageId ?? null;
+
+  if (useStreamingAPI) {
+    console.log(`[bot] Streaming API mode, messageId=${streamingMessageId}`);
+  } else {
+    console.log(`[bot] Legacy editMessage mode (streaming API unavailable)`);
+  }
+
   const words = SONG_LYRICS.split(/(\s+)/); // split but keep whitespace
   let accumulated = '';
-  let messageId = null;
+
+  // Legacy mode state
+  let legacyMessageId = null;
   let lastEditTime = 0;
+
+  // Streaming mode state — track how much has been sent to compute deltas
+  let lastSentLength = 0;
+  let lastChunkTime = 0;
 
   for (let i = 0; i < words.length; i++) {
     accumulated += words[i];
-
+    const isLast = i === words.length - 1;
     const now = Date.now();
-    const timeSinceLastEdit = now - lastEditTime;
 
-    // Flush to Privos every EDIT_INTERVAL_MS or on last word
-    if (timeSinceLastEdit >= EDIT_INTERVAL_MS || i === words.length - 1) {
-      try {
-        if (!messageId) {
-          const result = await sendMessage(roomId, accumulated);
-          messageId = result.messageId || result.message?._id || result.message?.id;
-          console.log(`[stream] SEND ok, msgId=${messageId} (${accumulated.length}ch)`);
-        } else {
-          await editMessage(messageId, accumulated);
-          console.log(`[stream] EDIT ok (${accumulated.length}ch)`);
+    if (useStreamingAPI) {
+      const timeSinceChunk = now - lastChunkTime;
+      // Send delta chunk every CHUNK_INTERVAL_MS or on last word
+      if (timeSinceChunk >= CHUNK_INTERVAL_MS || isLast) {
+        const delta = accumulated.substring(lastSentLength);
+        if (delta) {
+          try {
+            if (isLast) {
+              // Final call — end the stream with the complete text
+              await endStreaming(streamingMessageId, accumulated);
+              console.log(`[stream] END ok (${accumulated.length}ch total)`);
+            } else {
+              await streamChunk(streamingMessageId, delta);
+              console.log(`[stream] CHUNK ok (${delta.length}ch delta)`);
+            }
+            lastSentLength = accumulated.length;
+            lastChunkTime = Date.now();
+          } catch (err) {
+            console.error('[stream] Chunk error:', err.message);
+          }
         }
-        lastEditTime = Date.now();
-      } catch (err) {
-        console.error('[stream] Edit/send error:', err.message);
+      }
+    } else {
+      const timeSinceLastEdit = now - lastEditTime;
+      // Flush to Privos every EDIT_INTERVAL_MS or on last word
+      if (timeSinceLastEdit >= EDIT_INTERVAL_MS || isLast) {
+        try {
+          if (!legacyMessageId) {
+            const result = await sendMessage(roomId, accumulated);
+            legacyMessageId = result.messageId || result.message?._id || result.message?.id;
+            console.log(`[stream] SEND ok, msgId=${legacyMessageId} (${accumulated.length}ch)`);
+          } else {
+            await editMessage(legacyMessageId, accumulated);
+            console.log(`[stream] EDIT ok (${accumulated.length}ch)`);
+          }
+          lastEditTime = Date.now();
+        } catch (err) {
+          console.error('[stream] Edit/send error:', err.message);
+        }
       }
     }
 
@@ -408,6 +450,37 @@ async function setTyping(roomId, isTyping) {
   } catch (err) {
     console.error('[privos] Typing error:', err.message);
   }
+}
+
+// Returns { messageId } on success, null if streaming API unavailable (404 / error)
+async function startStreaming(roomId) {
+  try {
+    const res = await fetch(`${PRIVOS_URL}/api/v1/bot/startStreaming`, {
+      method: 'POST',
+      headers: BOT_HEADERS,
+      body: JSON.stringify({ roomId }),
+    });
+    if (!res.ok) return null; // fallback signal
+    return res.json();
+  } catch {
+    return null;
+  }
+}
+
+async function streamChunk(messageId, text) {
+  await fetch(`${PRIVOS_URL}/api/v1/bot/streamChunk`, {
+    method: 'POST',
+    headers: BOT_HEADERS,
+    body: JSON.stringify({ messageId, text }),
+  });
+}
+
+async function endStreaming(messageId, text) {
+  await fetch(`${PRIVOS_URL}/api/v1/bot/endStreaming`, {
+    method: 'POST',
+    headers: BOT_HEADERS,
+    body: JSON.stringify({ messageId, text }),
+  });
 }
 
 async function registerWebhook() {
