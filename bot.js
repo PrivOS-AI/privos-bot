@@ -16,7 +16,8 @@ const {
 
 const PRIVOS_BOT_USER_ID = PRIVOS_BOT_TOKEN?.split('_')[1];
 const BOT_HEADERS = { Authorization: `Bearer ${PRIVOS_BOT_TOKEN}`, 'Content-Type': 'application/json' };
-const EDIT_INTERVAL_MS = 800;
+const EDIT_INTERVAL_MS = 800;      // legacy editMessage cadence
+const CHUNK_INTERVAL_MS = 150;     // streaming API cadence (no DB write per chunk)
 
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok', uptime: process.uptime() });
@@ -77,30 +78,49 @@ async function streamAndReply({ prompt, roomId, projectName }) {
   });
   if (!res.ok) throw new Error(`TVibe ${res.status}: ${await res.text()}`);
 
+  // Try streaming API — returns null if unavailable (404 / network error)
+  const streamingSession = await startStreaming(roomId);
+  const useStreamingAPI = streamingSession !== null;
+  const streamingMessageId = streamingSession?.messageId ?? null;
+
+  if (useStreamingAPI) {
+    console.log(`[bot] Streaming API mode, messageId=${streamingMessageId}`);
+  } else {
+    console.log(`[bot] Legacy editMessage mode (streaming API unavailable)`);
+  }
+
   let accumulated = '';
   let statusText = ''; // tool activity indicator
-  let messageId = null;
+
+  // --- Legacy mode state ---
+  let legacyMessageId = null;
   let flushChain = Promise.resolve();
   let flushTimer = null;
+
+  // --- Streaming mode state ---
+  let lastSentLength = 0;
+  let chunkTimer = null;
 
   const TOOL_ICONS = {
     WebSearch: '🔍', WebFetch: '🌐', Read: '📄', Write: '✏️', Edit: '✏️',
     Bash: '⚙️', Grep: '🔎', Glob: '📁', Agent: '🤖', default: '🔧',
   };
 
+  // ---- Legacy flush helpers ----
+
   const flushEdit = () => {
     flushChain = flushChain.then(async () => {
       const display = accumulated || statusText;
       if (!display) return;
-      console.log(`[flush] msgId=${messageId} accumulated=${accumulated.length}ch status="${statusText.substring(0,50)}"`);
+      console.log(`[flush] msgId=${legacyMessageId} accumulated=${accumulated.length}ch status="${statusText.substring(0, 50)}"`);
       try {
-        if (!messageId) {
+        if (!legacyMessageId) {
           const result = await sendMessage(roomId, display);
-          messageId = result.messageId || result.message?._id || result.message?.id;
-          console.log(`[flush] SEND ok, msgId=${messageId}`);
-          if (!messageId) console.error('[privos] No messageId in response:', JSON.stringify(result).substring(0, 300));
+          legacyMessageId = result.messageId || result.message?._id || result.message?.id;
+          console.log(`[flush] SEND ok, msgId=${legacyMessageId}`);
+          if (!legacyMessageId) console.error('[privos] No messageId in response:', JSON.stringify(result).substring(0, 300));
         } else {
-          await editMessage(messageId, display);
+          await editMessage(legacyMessageId, display);
           console.log(`[flush] EDIT ok, ${display.length}ch`);
         }
       } catch (err) {
@@ -116,6 +136,36 @@ async function streamAndReply({ prompt, roomId, projectName }) {
       flushTimer = null;
       flushEdit();
     }, EDIT_INTERVAL_MS);
+  };
+
+  // ---- Streaming API chunk helpers ----
+
+  const flushChunk = async () => {
+    const delta = accumulated.substring(lastSentLength);
+    if (!delta && !statusText) return;
+
+    if (delta) {
+      // Send only the new delta text
+      await streamChunk(streamingMessageId, delta).catch((err) =>
+        console.error('[stream] Chunk error:', err.message)
+      );
+      console.log(`[chunk] sent ${delta.length}ch delta`);
+      lastSentLength = accumulated.length;
+    } else if (statusText && lastSentLength === 0) {
+      // No text yet but there is a tool status — send it as a chunk
+      await streamChunk(streamingMessageId, statusText).catch((err) =>
+        console.error('[stream] Status chunk error:', err.message)
+      );
+      console.log(`[chunk] sent status: "${statusText.substring(0, 50)}"`);
+    }
+  };
+
+  const scheduleChunk = () => {
+    if (chunkTimer) return;
+    chunkTimer = setTimeout(async () => {
+      chunkTimer = null;
+      await flushChunk();
+    }, CHUNK_INTERVAL_MS);
   };
 
   return new Promise((resolve, reject) => {
@@ -148,17 +198,35 @@ async function streamAndReply({ prompt, roomId, projectName }) {
     }
 
     function handleSSEEvent(eventType, data) {
-      console.log(`[sse] event=${eventType} type=${data.type} subtype=${data.subtype||''}`);
+      console.log(`[sse] event=${eventType} type=${data.type} subtype=${data.subtype || ''}`);
+
       if (eventType === 'done') {
-        if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
-        flushEdit().then(async () => {
-          await setTyping(roomId, false);
-          if (!accumulated) {
-            await sendMessage(roomId, 'I received your message but could not generate a response.');
-          }
-          console.log(`[bot] Stream complete (${accumulated.length} chars)`);
-          resolve();
-        });
+        if (useStreamingAPI) {
+          if (chunkTimer) { clearTimeout(chunkTimer); chunkTimer = null; }
+          // Flush any remaining delta then end the stream
+          endStreaming(streamingMessageId, accumulated)
+            .catch((err) => console.error('[stream] endStreaming error:', err.message))
+            .then(async () => {
+              await setTyping(roomId, false);
+              if (!accumulated) {
+                // No text was ever accumulated — send a fallback message
+                await sendMessage(roomId, 'I received your message but could not generate a response.')
+                  .catch((err) => console.error('[privos] Fallback send error:', err.message));
+              }
+              console.log(`[bot] Stream complete (${accumulated.length} chars)`);
+              resolve();
+            });
+        } else {
+          if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
+          flushEdit().then(async () => {
+            await setTyping(roomId, false);
+            if (!accumulated) {
+              await sendMessage(roomId, 'I received your message but could not generate a response.');
+            }
+            console.log(`[bot] Stream complete (${accumulated.length} chars)`);
+            resolve();
+          });
+        }
         return;
       }
 
@@ -168,14 +236,22 @@ async function streamAndReply({ prompt, roomId, projectName }) {
         const icon = TOOL_ICONS[block.name] || TOOL_ICONS.default;
         const hint = toolSummary(block.input);
         statusText = `${icon} **${block.name}**${hint ? `: ${hint}` : ''}`;
-        if (!accumulated) scheduleEdit();
+        if (useStreamingAPI) {
+          if (!accumulated) scheduleChunk();
+        } else {
+          if (!accumulated) scheduleEdit();
+        }
         return;
       }
 
       // Streaming text deltas — append incrementally
       if (data.type === 'content_block_delta' && data.delta?.type === 'text_delta' && data.delta.text) {
         accumulated += data.delta.text;
-        scheduleEdit();
+        if (useStreamingAPI) {
+          scheduleChunk();
+        } else {
+          scheduleEdit();
+        }
         return;
       }
 
@@ -188,19 +264,31 @@ async function streamAndReply({ prompt, roomId, projectName }) {
               const icon = TOOL_ICONS[block.name] || TOOL_ICONS.default;
               const hint = toolSummary(block.input);
               statusText = `${icon} **${block.name}**${hint ? `: ${hint}` : ''}`;
-              if (!accumulated) scheduleEdit();
+              if (useStreamingAPI) {
+                if (!accumulated) scheduleChunk();
+              } else {
+                if (!accumulated) scheduleEdit();
+              }
             }
           }
           const text = content.filter(b => b.type === 'text').map(b => b.text || '').join('');
           if (text) {
             accumulated = text;
             statusText = '';
-            scheduleEdit();
+            if (useStreamingAPI) {
+              scheduleChunk();
+            } else {
+              scheduleEdit();
+            }
           }
         } else if (typeof content === 'string' && content) {
           accumulated = content;
           statusText = '';
-          scheduleEdit();
+          if (useStreamingAPI) {
+            scheduleChunk();
+          } else {
+            scheduleEdit();
+          }
         }
       }
     }
@@ -208,11 +296,21 @@ async function streamAndReply({ prompt, roomId, projectName }) {
     function read() {
       reader.read().then(({ done, value }) => {
         if (done) {
-          if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
-          flushEdit().then(async () => {
-            await setTyping(roomId, false);
-            resolve();
-          });
+          if (useStreamingAPI) {
+            if (chunkTimer) { clearTimeout(chunkTimer); chunkTimer = null; }
+            endStreaming(streamingMessageId, accumulated)
+              .catch((err) => console.error('[stream] endStreaming error:', err.message))
+              .then(async () => {
+                await setTyping(roomId, false);
+                resolve();
+              });
+          } else {
+            if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
+            flushEdit().then(async () => {
+              await setTyping(roomId, false);
+              resolve();
+            });
+          }
           return;
         }
         processChunk(decoder.decode(value, { stream: true }));
@@ -256,6 +354,37 @@ async function setTyping(roomId, isTyping) {
   } catch (err) {
     console.error('[privos] Typing error:', err.message);
   }
+}
+
+// Returns { messageId } on success, null if streaming API unavailable (404 / error)
+async function startStreaming(roomId) {
+  try {
+    const res = await fetch(`${PRIVOS_URL}/api/v1/bot/startStreaming`, {
+      method: 'POST',
+      headers: BOT_HEADERS,
+      body: JSON.stringify({ roomId }),
+    });
+    if (!res.ok) return null; // fallback signal
+    return res.json();
+  } catch {
+    return null;
+  }
+}
+
+async function streamChunk(messageId, text) {
+  await fetch(`${PRIVOS_URL}/api/v1/bot/streamChunk`, {
+    method: 'POST',
+    headers: BOT_HEADERS,
+    body: JSON.stringify({ messageId, text }),
+  });
+}
+
+async function endStreaming(messageId, text) {
+  await fetch(`${PRIVOS_URL}/api/v1/bot/endStreaming`, {
+    method: 'POST',
+    headers: BOT_HEADERS,
+    body: JSON.stringify({ messageId, text }),
+  });
 }
 
 async function registerWebhook() {
