@@ -15,6 +15,7 @@ const {
 } = process.env;
 
 const PRIVOS_BOT_USER_ID = PRIVOS_BOT_TOKEN?.split('_')[1];
+let PRIVOS_BOT_USERNAME = null; // fetched on startup
 const BOT_HEADERS = { Authorization: `Bearer ${PRIVOS_BOT_TOKEN}`, 'Content-Type': 'application/json' };
 const EDIT_INTERVAL_MS = 800;      // legacy editMessage cadence
 const CHUNK_INTERVAL_MS = 150;     // streaming API cadence (no DB write per chunk)
@@ -29,12 +30,27 @@ app.post('/webhook', (req, res) => {
     return res.status(401).json({ error: 'Unauthorized' });
   }
 
-  const { event, room, message } = req.body;
-  console.log(`[webhook] event=${event} room=${room?.id} sender=${message?.username}`);
+  const { event, room, message, bot } = req.body;
+  console.log(`[webhook] event=${event} room=${room?.id} type=${room?.type} sender=${message?.username} bot=${bot?.username}`);
 
   if (event !== 'message.new') return res.sendStatus(200);
   if (message?.userId === PRIVOS_BOT_USER_ID) return res.sendStatus(200);
   if (!message?.msg) return res.sendStatus(200);
+
+  // Learn bot username from webhook payload
+  if (bot?.username && !PRIVOS_BOT_USERNAME) {
+    PRIVOS_BOT_USERNAME = bot.username;
+    console.log(`[bot] Learned username: @${PRIVOS_BOT_USERNAME}`);
+  }
+
+  // In group rooms (channels/groups), only reply when bot is @mentioned in text
+  if (room?.type !== 'd' && PRIVOS_BOT_USERNAME) {
+    const mentionPattern = new RegExp(`@${PRIVOS_BOT_USERNAME}\\b`, 'i');
+    if (!mentionPattern.test(message.msg || message.text || '')) {
+      console.log(`[webhook] Skipping group message (bot @${PRIVOS_BOT_USERNAME} not in: "${(message.msg || message.text || '').substring(0, 80)}")`);
+      return res.sendStatus(200);
+    }
+  }
 
   res.sendStatus(200);
   handleMessage(room, message).catch((err) => console.error('[handleMessage]', err.message));
@@ -46,12 +62,19 @@ async function handleMessage(room, message) {
   const roomName = room.type === 'd' ? senderName : (room.name || senderName);
   const projectName = `Chat with ${roomName}`;
 
-  console.log(`[bot] ${senderName}: "${message.msg.substring(0, 80)}"`);
+  // Strip bot @mention from the prompt so LLM gets clean text
+  let prompt = message.msg;
+  if (PRIVOS_BOT_USERNAME) {
+    prompt = prompt.replace(new RegExp(`@${PRIVOS_BOT_USERNAME}\\b`, 'gi'), '').trim();
+  }
+  if (!prompt) prompt = 'Hello';
+
+  console.log(`[bot] ${senderName}: "${prompt.substring(0, 80)}"`);
 
   await setTyping(roomId, true);
 
   try {
-    await streamAndReply({ prompt: message.msg, roomId, projectName });
+    await streamAndReply({ prompt, roomId, projectName });
   } catch (err) {
     console.error('[stream] Error:', err.message);
     await sendMessage(roomId, 'Sorry, an error occurred while generating the response.');
